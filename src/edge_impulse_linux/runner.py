@@ -1,19 +1,66 @@
-import subprocess
+import json
 import os.path
-import tempfile
 import shutil
-import time
 import signal
 import socket
-import json
-from multiprocessing import shared_memory, resource_tracker
+import subprocess
+import tempfile
+import time
+from multiprocessing import resource_tracker, shared_memory
+
 import numpy as np
 
+
+def _extract_first_json(data: bytes):
+    """Extracts and returns the first JSON object found in the UTF-8 decoded data."""
+    braces_open = 0
+    braces_closed = 0
+    line = ""
+    resp = None
+
+    for c in data.decode("utf-8"):
+        if c == "{":
+            line += c
+            braces_open += 1
+        elif c == "}":
+            line += c
+            braces_closed += 1
+            if braces_closed == braces_open:
+                try:
+                    resp = json.loads(line)
+                except json.JSONDecodeError:
+                    resp = None
+        elif braces_open > 0:
+            line += c
+
+        if resp is not None:
+            break
+
+    return resp
+
+
 def now():
+    """Returns the current time in milliseconds.
+
+    Returns:
+        int: The current time in milliseconds.
+    """
     return round(time.time() * 1000)
 
+
 class ImpulseRunner:
+    """Class to manage running an EI model.
+
+    Manages an impulse model as a subprocess and communicaties with it
+    via Unix sockets.
+    """
+
     def __init__(self, model_path: str):
+        """Initializes the ImpulseRunner.
+
+        Args:
+            model_path (str): Path to the executable model file.
+        """
         self._model_path = model_path
         self._tempdir = None
         self._runner = None
@@ -24,11 +71,26 @@ class ImpulseRunner:
         self._shm = None
 
     def init(self, debug=False):
+        """Initializes and starts the model runner subprocess.
+
+        Args:
+            debug (bool, optional): If True, runs in debug mode.
+                Defaults to False.
+
+        Returns:
+            dict: The response from the initial 'hello' message.
+
+        Raises:
+            FileNotFoundError: If the model file does not exist, is not executable,
+                or the runner fails to start.
+        """
         if not os.path.exists(self._model_path):
-            raise Exception("Model file does not exist: " + self._model_path)
+            raise FileNotFoundError("Model file does not exist: " + self._model_path)
 
         if not os.access(self._model_path, os.X_OK):
-            raise Exception('Model file "' + self._model_path + '" is not executable')
+            raise FileNotFoundError(
+                'Model file "' + self._model_path + '" is not executable'
+            )
 
         self._debug = debug
         self._tempdir = tempfile.mkdtemp()
@@ -54,16 +116,20 @@ class ImpulseRunner:
 
         hello_resp = self._hello_resp = self.hello()
 
-        if ('features_shm' in hello_resp.keys()):
-            shm_name = hello_resp['features_shm']['name']
+        if "features_shm" in hello_resp.keys():
+            shm_name = hello_resp["features_shm"]["name"]
             # python does not want the leading slash
-            shm_name = shm_name.lstrip('/')
+            shm_name = shm_name.lstrip("/")
             shm = shared_memory.SharedMemory(name=shm_name)
             self._shm = {
-                'shm': shm,
-                'type': hello_resp['features_shm']['type'],
-                'elements': hello_resp['features_shm']['elements'],
-                'array': np.ndarray((hello_resp['features_shm']['elements'],), dtype=np.float32, buffer=shm.buf)
+                "shm": shm,
+                "type": hello_resp["features_shm"]["type"],
+                "elements": hello_resp["features_shm"]["elements"],
+                "array": np.ndarray(
+                    (hello_resp["features_shm"]["elements"],),
+                    dtype=np.float32,
+                    buffer=shm.buf,
+                ),
             }
 
         return self._hello_resp
@@ -72,6 +138,7 @@ class ImpulseRunner:
         self.stop()
 
     def stop(self):
+        """Stops the runner process and cleans up resources."""
         if self._tempdir is not None:
             shutil.rmtree(self._tempdir)
             self._tempdir = None
@@ -86,17 +153,33 @@ class ImpulseRunner:
             self._runner = None
 
         if self._shm is not None:
-            self._shm['shm'].close()
-            resource_tracker.unregister(self._shm['shm']._name, "shared_memory")
+            self._shm["shm"].close()
+            resource_tracker.unregister(self._shm["shm"]._name, "shared_memory")
             self._shm = None
 
     def hello(self):
+        """Sends a 'hello' message to the runner; returns info about the model.
+
+        Returns:
+            dict: The response from the runner.
+        """
         msg = {"hello": 1}
         return self.send_msg(msg)
 
     def classify(self, data):
+        """Classifies the given data using the model.
+
+        Args:
+            data (any): The data to classify.
+
+        Returns:
+            dict: The classification response.
+
+        Raises:
+            Exception: If classification fails.
+        """
         if self._shm:
-            self._shm['array'][:] = data
+            self._shm["array"][:] = data
 
             msg = {
                 "classify_shm": {
@@ -105,7 +188,6 @@ class ImpulseRunner:
             }
         else:
             msg = {"classify": data}
-
         if self._debug:
             msg["debug"] = True
 
@@ -113,15 +195,24 @@ class ImpulseRunner:
         return send_resp
 
     def set_threshold(self, obj):
-        if not 'id' in obj:
+        if not "id" in obj:
             raise Exception('set_threshold requires an object with an "id" field')
 
-        msg = { 'set_threshold': obj }
+        msg = {"set_threshold": obj}
         return self.send_msg(msg)
 
     def send_msg(self, msg):
-        t_send_msg = now()
+        """Classifies the given data using the model.
 
+        Args:
+            data (any): The data to classify.
+
+        Returns:
+            dict: The classification response.
+
+        Raises:
+            Exception: If classification fails.
+        """
         if not self._client:
             raise Exception("ImpulseRunner is not initialized (call init())")
 
@@ -130,8 +221,6 @@ class ImpulseRunner:
 
         msg["id"] = ix
         self._client.send(json.dumps(msg).encode("utf-8"))
-
-        t_sent_msg = now()
 
         data = b""
         while True:
@@ -142,27 +231,7 @@ class ImpulseRunner:
                 break
             data = data + chunk
 
-        t_received_msg = now()
-
-        braces_open = 0
-        braces_closed = 0
-        line = ""
-        resp = None
-
-        for c in data.decode("utf-8"):
-            if c == "{":
-                line = line + c
-                braces_open = braces_open + 1
-            elif c == "}":
-                line = line + c
-                braces_closed = braces_closed + 1
-                if braces_closed == braces_open:
-                    resp = json.loads(line)
-            elif braces_open > 0:
-                line = line + c
-
-            if resp is not None:
-                break
+        resp = _extract_first_json(data)
 
         if resp is None:
             raise Exception("No data or corrupted data received")
@@ -176,6 +245,4 @@ class ImpulseRunner:
         del resp["id"]
         del resp["success"]
 
-        t_parsed_msg = now()
-        # print('sent', t_sent_msg - t_send_msg, 'received', t_received_msg - t_send_msg, 'parsed', t_parsed_msg - t_send_msg)
         return resp
